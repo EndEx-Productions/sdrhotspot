@@ -13,14 +13,12 @@ LISTEN_PORT = 1234
 UPSTREAM_HOST = '127.0.0.1'
 UPSTREAM_PORT = 1235
 
-SAMPLE_RATE = 250_000
-BYTES_PER_SEC = SAMPLE_RATE * 2   # I+Q, 8-bit each
+DEFAULT_SAMPLE_RATE = 2_048_000  # rtl_tcp's own built-in default before any client command
 
-CUSHION_BYTES = 1_500_000     # ~3s of stream; buffer this much before draining to client
-MAX_BUFFER_BYTES = 6_000_000  # safety cap so latency can't grow unbounded
+CUSHION_SECONDS = 3      # buffer this many seconds of stream before draining to client
+MAX_BUFFER_SECONDS = 12  # safety cap so latency can't grow unbounded
 CHUNK = 65536
 TICK_SECONDS = 0.02
-BYTES_PER_TICK = int(BYTES_PER_SEC * TICK_SECONDS)
 
 
 def log(*a):
@@ -83,6 +81,7 @@ def handle_client(client_sock, addr):
     buf = collections.deque([header])
     buf_bytes = len(header)
     lock = threading.Condition()
+    sample_rate = DEFAULT_SAMPLE_RATE
 
     def upstream_to_buffer():
         nonlocal buf_bytes
@@ -94,7 +93,8 @@ def handle_client(client_sock, addr):
                 with lock:
                     buf.append(data)
                     buf_bytes += len(data)
-                    while buf_bytes > MAX_BUFFER_BYTES and buf:
+                    max_buffer_bytes = sample_rate * 2 * MAX_BUFFER_SECONDS
+                    while buf_bytes > max_buffer_bytes and buf:
                         dropped = buf.popleft()
                         buf_bytes -= len(dropped)
                     lock.notify_all()
@@ -129,7 +129,7 @@ def handle_client(client_sock, addr):
             # wait for initial cushion before starting to drain, so brief upstream
             # stalls later can be absorbed without an audible gap at the client
             with lock:
-                while buf_bytes < CUSHION_BYTES and not stop.is_set():
+                while buf_bytes < sample_rate * 2 * CUSHION_SECONDS and not stop.is_set():
                     lock.wait(timeout=0.5)
 
             next_tick = time.monotonic()
@@ -141,7 +141,8 @@ def handle_client(client_sock, addr):
                 next_tick += TICK_SECONDS
 
                 with lock:
-                    chunk = take(BYTES_PER_TICK)
+                    bytes_per_tick = int(sample_rate * 2 * TICK_SECONDS)
+                    chunk = take(bytes_per_tick)
 
                 if chunk:
                     client_sock.sendall(chunk)
@@ -155,12 +156,27 @@ def handle_client(client_sock, addr):
                 lock.notify_all()
 
     def client_to_upstream():
+        nonlocal sample_rate
+        pending = b''
         try:
             while not stop.is_set():
                 data = client_sock.recv(CHUNK)
                 if not data:
                     break
                 upstream.sendall(data)
+                # rtl_tcp's client->server protocol is just a stream of 5-byte
+                # commands (1-byte cmd + 4-byte big-endian param); snoop it so
+                # the relay's pacing tracks whatever sample rate the client
+                # actually asks for, instead of assuming a fixed rate.
+                pending += data
+                while len(pending) >= 5:
+                    cmd, param = pending[0], int.from_bytes(pending[1:5], 'big')
+                    pending = pending[5:]
+                    if cmd == 2:
+                        log(f"client set sample rate to {param}")
+                        with lock:
+                            sample_rate = param
+                            lock.notify_all()
         except OSError:
             pass
         finally:
@@ -184,7 +200,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((LISTEN_HOST, LISTEN_PORT))
     srv.listen(1)
-    log(f"relay listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}, cushion={CUSHION_BYTES}B")
+    log(f"relay listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}, cushion={CUSHION_SECONDS}s (rate-adaptive)")
     while True:
         client_sock, addr = srv.accept()
         client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
