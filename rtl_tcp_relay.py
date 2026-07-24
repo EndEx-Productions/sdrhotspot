@@ -4,6 +4,9 @@ import threading
 import collections
 import sys
 import time
+import os
+import signal
+import subprocess
 
 LISTEN_HOST = '0.0.0.0'
 LISTEN_PORT = 1234
@@ -24,20 +27,61 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def kill_rtl_tcp():
+    """rtl_tcp is known to occasionally wedge inside rtlsdr_cancel_async() after a
+    client disconnects, hanging for minutes without exiting. It runs as the same
+    user as this relay, so we can SIGKILL it directly (no sudo needed) and let
+    systemd's Restart=always bring up a fresh process."""
+    try:
+        result = subprocess.run(['pgrep', '-x', 'rtl_tcp'], capture_output=True, text=True)
+        pids = [int(p) for p in result.stdout.split()]
+        for pid in pids:
+            log(f"rtl_tcp looks wedged; sending SIGKILL to pid {pid}")
+            os.kill(pid, signal.SIGKILL)
+    except Exception as e:
+        log(f"failed to kill rtl_tcp: {e}")
+
+
+def connect_upstream():
+    """Connect to rtl_tcp and confirm it's actually alive by reading the 12-byte
+    dongle_info header. If it doesn't respond in time (the wedged-process bug),
+    kill it and retry rather than hanging the client for minutes."""
+    for attempt in range(1, 5):
+        sock = None
+        try:
+            sock = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=3)
+            sock.settimeout(5)
+            header = b''
+            while len(header) < 12:
+                chunk = sock.recv(12 - len(header))
+                if not chunk:
+                    raise OSError("upstream closed before sending header")
+                header += chunk
+            sock.settimeout(None)
+            return sock, header
+        except (OSError, socket.timeout) as e:
+            log(f"upstream connect/header attempt {attempt} failed ({e})")
+            if sock is not None:
+                sock.close()
+            kill_rtl_tcp()
+            time.sleep(4)  # give systemd (RestartSec=3) time to bring rtl_tcp back
+    raise OSError("rtl_tcp did not recover after repeated attempts")
+
+
 def handle_client(client_sock, addr):
     log(f"client connected: {addr}")
     try:
-        upstream = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=5)
+        upstream, header = connect_upstream()
     except OSError as e:
-        log(f"failed to connect to upstream rtl_tcp: {e}")
+        log(f"giving up on upstream: {e}")
         client_sock.close()
         return
     upstream.settimeout(None)
     client_sock.settimeout(None)
 
     stop = threading.Event()
-    buf = collections.deque()
-    buf_bytes = 0
+    buf = collections.deque([header])
+    buf_bytes = len(header)
     lock = threading.Condition()
 
     def upstream_to_buffer():
@@ -145,6 +189,14 @@ def main():
         client_sock, addr = srv.accept()
         client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         handle_client(client_sock, addr)
+        # rtl_tcp reliably wedges inside rtlsdr_cancel_async() after a client
+        # disconnects (observed 3/3 times), hanging for minutes rather than
+        # cleanly going back to accepting. Rather than waiting for that to be
+        # noticed on the next connect attempt, proactively recycle it right
+        # away so it's already healthy before anyone tries to reconnect.
+        log("client session ended; preemptively recycling rtl_tcp")
+        kill_rtl_tcp()
+        time.sleep(4)
 
 
 if __name__ == '__main__':
