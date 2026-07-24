@@ -1,0 +1,12 @@
+[Unit]
+Description=rtl_tcp SDR server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/rtl_tcp -a 127.0.0.1 -p 1235
+Restart=always
+RestartSec=3
+User=umbra
+
+[Install]
+WantedBy=multi-user.target

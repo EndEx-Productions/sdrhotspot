@@ -1,0 +1,13 @@
+[Unit]
+Description=rtl_tcp buffering relay
+After=network.target rtl_tcp.service
+Requires=rtl_tcp.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/umbra/rtl_tcp_relay.py
+Restart=always
+RestartSec=3
+User=umbra
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+Patch against osmocom/rtl-sdr tag v2.0.2, src/rtl_tcp.c.
+
+Adds TCP_NODELAY on the accepted client socket. This was an attempt to fix
+the streaming stutter (theory: Nagle's algorithm + delayed ACKs causing
+periodic stalls on rtl_tcp's small/bursty writes). Tested on real hardware:
+did NOT fix the stutter (root cause turned out to be rtl_tcp's own bursty
+internal buffering, fixed instead by the pacing relay in this repo). Kept
+in place anyway since it's a harmless, theoretically-still-correct change.
+
+--- a/src/rtl_tcp.c
++++ b/src/rtl_tcp.c
+@@ -32,6 +32,7 @@
+ #include <sys/time.h>
+ #include <netdb.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
+ #include <fcntl.h>
+ #else
+ #include <winsock2.h>
+@@ -610,6 +611,11 @@
+
+ 		setsockopt(s, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+
++		{
++			int nodelay = 1;
++			setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
++		}
++
+ 		getnameinfo((struct sockaddr *)&remote, rlen,
+ 			    remhostinfo, NI_MAXHOST,
+ 			    remportinfo, NI_MAXSERV, NI_NUMERICSERV);
